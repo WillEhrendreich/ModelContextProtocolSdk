@@ -8,7 +8,7 @@ using System.Diagnostics;
 
 namespace ModelContextProtocol.AspNetCore;
 
-internal sealed class SseHandler(
+internal sealed partial class SseHandler(
     IOptions<McpServerOptions> mcpServerOptionsSnapshot,
     IOptionsFactory<McpServerOptions> mcpServerOptionsFactory,
     IOptions<HttpServerTransportOptions> httpMcpServerOptions,
@@ -16,9 +16,33 @@ internal sealed class SseHandler(
     ILoggerFactory loggerFactory)
 {
     private readonly ConcurrentDictionary<string, SseSession> _sessions = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider = httpMcpServerOptions.Value.TimeProvider;
+    private readonly ILogger _logger = loggerFactory.CreateLogger<SseHandler>();
+
+    public int SessionCount => _sessions.Count;
 
     public async Task HandleSseRequestAsync(HttpContext context)
     {
+        // Circuit breaker: reject new SSE connections when over the limit.
+        // This prevents reconnect storms from overwhelming the server — rejected connections
+        // return 503 immediately without allocating session resources.
+        var maxSessions = httpMcpServerOptions.Value.MaxIdleSessionCount;
+        if (_sessions.Count >= maxSessions)
+        {
+            // Trigger a prune cycle inline to free up space
+            PruneIdleSessions();
+
+            // If still over limit after pruning, reject
+            if (_sessions.Count >= maxSessions)
+            {
+                LogSseConnectionRejected(_sessions.Count, maxSessions);
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                context.Response.Headers["Retry-After"] = "5";
+                await context.Response.WriteAsync("Too many SSE sessions. Retry later.");
+                return;
+            }
+        }
+
         var sessionId = StreamableHttpHandler.MakeNewSessionId();
 
         // If the server is shutting down, we need to cancel all SSE connections immediately without waiting for HostOptions.ShutdownTimeout
@@ -33,7 +57,7 @@ internal sealed class SseHandler(
         await using var transport = new SseResponseStreamTransport(context.Response.Body, $"{endpointPattern}message?sessionId={sessionId}", sessionId);
 
         var userIdClaim = StreamableHttpHandler.GetUserIdClaim(context.User);
-        var sseSession = new SseSession(transport, userIdClaim);
+        var sseSession = new SseSession(transport, userIdClaim, sseCts, context, _timeProvider.GetTimestamp());
 
         if (!_sessions.TryAdd(sessionId, sseSession))
         {
@@ -96,6 +120,9 @@ internal sealed class SseHandler(
             return;
         }
 
+        // Update activity timestamp — this session is actively being used
+        sseSession.LastActivityTicks = _timeProvider.GetTimestamp();
+
         var message = await StreamableHttpHandler.ReadJsonRpcMessageAsync(context);
         if (message is null)
         {
@@ -108,5 +135,106 @@ internal sealed class SseHandler(
         await context.Response.WriteAsync("Accepted");
     }
 
-    private record SseSession(SseResponseStreamTransport Transport, UserIdClaim? UserId);
+    /// <summary>
+    /// Prunes SSE sessions that have been idle longer than <see cref="HttpServerTransportOptions.IdleTimeout"/>,
+    /// and enforces <see cref="HttpServerTransportOptions.MaxIdleSessionCount"/> by cancelling the oldest idle sessions.
+    /// Called by <see cref="IdleTrackingBackgroundService"/> on the same 5-second interval used for Streamable HTTP sessions.
+    /// </summary>
+    public void PruneIdleSessions()
+    {
+        var options = httpMcpServerOptions.Value;
+        var idleTimeout = options.IdleTimeout;
+        var maxIdleSessionCount = options.MaxIdleSessionCount;
+
+        if (idleTimeout == Timeout.InfiniteTimeSpan && maxIdleSessionCount >= int.MaxValue)
+        {
+            return;
+        }
+
+        var now = _timeProvider.GetTimestamp();
+        var idleTimeoutTicks = idleTimeout == Timeout.InfiniteTimeSpan
+            ? long.MaxValue
+            : (long)(idleTimeout.Ticks * _timeProvider.TimestampFrequency / (double)TimeSpan.TicksPerSecond);
+        var cutoff = now - idleTimeoutTicks;
+
+        // First pass: remove sessions that exceed IdleTimeout
+        List<(string Id, long Ticks)>? remaining = null;
+        foreach (var (id, session) in _sessions)
+        {
+            if (session.Cts.IsCancellationRequested)
+            {
+                continue;
+            }
+
+            if (session.LastActivityTicks < cutoff)
+            {
+                LogSseIdleSessionTimeout(id, idleTimeout);
+                CancelAndRemoveSession(id);
+                continue;
+            }
+
+            remaining ??= [];
+            remaining.Add((id, session.LastActivityTicks));
+        }
+
+        // Second pass: enforce MaxIdleSessionCount by removing oldest
+        if (remaining is not null && remaining.Count > maxIdleSessionCount)
+        {
+            remaining.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
+            var toRemove = remaining.Count - maxIdleSessionCount;
+            for (var i = 0; i < toRemove; i++)
+            {
+                LogSseIdleSessionLimit(remaining[i].Id, maxIdleSessionCount);
+                CancelAndRemoveSession(remaining[i].Id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cancels and removes all SSE sessions, typically called during graceful shutdown.
+    /// </summary>
+    public void CancelAllSessions()
+    {
+        foreach (var (id, _) in _sessions)
+        {
+            CancelAndRemoveSession(id);
+        }
+    }
+
+    private void CancelAndRemoveSession(string sessionId)
+    {
+        if (_sessions.TryRemove(sessionId, out var session))
+        {
+            try
+            {
+                // Abort the HTTP connection immediately — sends TCP RST, no graceful FIN handshake.
+                // This is necessary because CTS cancellation alone doesn't close the TCP socket fast
+                // enough to combat reconnect storms (~200+ connections/sec from misbehaving clients).
+                session.HttpContext.Abort();
+                session.Cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // CTS already disposed by the HandleSseRequestAsync finally block — session is already cleaning up
+            }
+        }
+    }
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "SSE IdleTimeout of {IdleTimeout} exceeded. Closing idle SSE session {SessionId}.")]
+    private partial void LogSseIdleSessionTimeout(string sessionId, TimeSpan idleTimeout);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "SSE MaxIdleSessionCount of {MaxIdleSessionCount} exceeded. Closing idle SSE session {SessionId}.")]
+    private partial void LogSseIdleSessionLimit(string sessionId, int maxIdleSessionCount);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "SSE connection rejected: {SessionCount} active sessions >= MaxIdleSessionCount {MaxIdleSessionCount}.")]
+    private partial void LogSseConnectionRejected(int sessionCount, int maxIdleSessionCount);
+
+    private sealed class SseSession(SseResponseStreamTransport transport, UserIdClaim? userId, CancellationTokenSource cts, HttpContext httpContext, long createdTicks)
+    {
+        public SseResponseStreamTransport Transport { get; } = transport;
+        public UserIdClaim? UserId { get; } = userId;
+        public CancellationTokenSource Cts { get; } = cts;
+        public HttpContext HttpContext { get; } = httpContext;
+        public long LastActivityTicks { get; set; } = createdTicks;
+    }
 }

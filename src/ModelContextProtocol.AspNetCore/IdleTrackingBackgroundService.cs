@@ -7,12 +7,14 @@ namespace ModelContextProtocol.AspNetCore;
 internal sealed partial class IdleTrackingBackgroundService : BackgroundService
 {
     private readonly StatefulSessionManager _sessions;
+    private readonly SseHandler _sseHandler;
     private readonly IOptions<HttpServerTransportOptions> _options;
     private readonly IHostApplicationLifetime _appLifetime;
     private readonly ILogger _logger;
 
     public IdleTrackingBackgroundService(
         StatefulSessionManager sessions,
+        SseHandler sseHandler,
         IOptions<HttpServerTransportOptions> options,
         IHostApplicationLifetime appLifetime,
         ILogger<IdleTrackingBackgroundService> logger)
@@ -26,6 +28,7 @@ internal sealed partial class IdleTrackingBackgroundService : BackgroundService
         ArgumentOutOfRangeException.ThrowIfLessThan(options.Value.MaxIdleSessionCount, 0);
 
         _sessions = sessions;
+        _sseHandler = sseHandler;
         _options = options;
         _appLifetime = appLifetime;
         _logger = logger;
@@ -41,6 +44,7 @@ internal sealed partial class IdleTrackingBackgroundService : BackgroundService
             while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
             {
                 await _sessions.PruneIdleSessionsAsync(stoppingToken);
+                _sseHandler.PruneIdleSessions();
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -50,6 +54,7 @@ internal sealed partial class IdleTrackingBackgroundService : BackgroundService
         {
             try
             {
+                _sseHandler.CancelAllSessions();
                 await _sessions.DisposeAllSessionsAsync();
             }
             finally
